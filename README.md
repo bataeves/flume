@@ -65,3 +65,16 @@ We recommend you set the following Maven options:
 
 To compile Flume and build a distribution tarball, run `mvn install` from the
 top level directory. The artifacts will be placed under `flume-ng-dist/target/`.
+
+
+## Docker
+## Usage
+
+    $ docker pull probablyfine/flume
+    $ docker run \
+      --env FLUME_AGENT_NAME=docker \
+      --volume /tmp/config.conf:/opt/flume-config/flume.conf \
+      --detach \
+      probablyfine/flume:latest
+
+Note: the `FLUME_AGENT_NAME` environment variable and presence of `/opt/flume-config/flume.conf` on the image are **required**.
