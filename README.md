@@ -68,12 +68,18 @@ top level directory. The artifacts will be placed under `flume-ng-dist/target/`.
 
 
 ## Docker
+## Build and Deploy
+```bash
+    bash docker-build.sh
+    docker push bataeves/flume
+```
 ## Usage
-
     $ docker pull bataeves/flume
     $ docker run \
-      --env FLUME_AGENT_NAME=docker \
-      --volume /tmp/config.conf:/opt/flume-config/flume.conf \
+      --name flume \
+      --rm \
+      --env FLUME_AGENT_NAME=agent \
+      --volume "$PWD/conf/flume-es-conf.properties:/opt/flume-config/flume.conf" \
       --detach \
       bataeves/flume:latest
 
