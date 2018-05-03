@@ -1,0 +1,1439 @@
+From f788b9ac2cfa70f513e32e7f7e1729bba98166be Mon Sep 17 00:00:00 2001
+From: "yonghaoz1994@gmail.com" <yonghaoz1994@gmail.com>
+Date: Mon, 19 Feb 2018 15:36:37 +0800
+Subject: [PATCH] FLUME-3021. flume Elasticsearch 5.0 not support
+
+---
+ flume-ng-sinks/flume-ng-elasticsearch-sink/pom.xml | 10 ++-
+ .../sink/elasticsearch/ContentBuilderUtil.java     | 11 +--
+ .../ElasticSearchDynamicSerializer.java            |  1 +
+ .../ElasticSearchEventSerializer.java              |  7 +-
+ .../ElasticSearchLogStashEventSerializer.java      |  6 +-
+ .../sink/elasticsearch/ElasticSearchSink.java      | 76 +++-----------------
+ .../elasticsearch/ElasticSearchSinkConstants.java  | 14 ++--
+ .../EventSerializerIndexRequestBuilderFactory.java |  8 ++-
+ .../elasticsearch/client/ElasticSearchClient.java  |  4 +-
+ .../client/ElasticSearchClientFactory.java         |  8 ++-
+ .../client/ElasticSearchRestClient.java            | 10 +--
+ .../client/ElasticSearchTransportClient.java       | 83 ++++++++++++++++------
+ .../AbstractElasticSearchSinkTest.java             | 44 +++++++-----
+ .../apache/flume/sink/elasticsearch/MockNode.java  | 59 +++++++++++++++
+ .../TestElasticSearchDynamicSerializer.java        |  8 +--
+ ...estElasticSearchIndexRequestBuilderFactory.java | 32 ++++++---
+ .../TestElasticSearchLogStashEventSerializer.java  |  6 +-
+ .../sink/elasticsearch/TestElasticSearchSink.java  | 65 +++++------------
+ .../TimeBasedIndexNameBuilderTest.java             |  3 +-
+ .../client/TestElasticSearchClientFactory.java     |  6 +-
+ .../client/TestElasticSearchRestClient.java        | 58 ++++-----------
+ .../client/TestElasticSearchTransportClient.java   | 37 +++++-----
+ pom.xml                                            | 15 +++-
+ 23 files changed, 284 insertions(+), 287 deletions(-)
+ create mode 100644 flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/MockNode.java
+
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/pom.xml b/flume-ng-sinks/flume-ng-elasticsearch-sink/pom.xml
+index 1df26b883..d241a70ba 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/pom.xml
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/pom.xml
+@@ -46,14 +46,13 @@
+     </dependency>
+ 
+     <dependency>
+-      <groupId>org.slf4j</groupId>
+-      <artifactId>slf4j-api</artifactId>
++      <groupId>org.elasticsearch</groupId>
++      <artifactId>elasticsearch</artifactId>
+     </dependency>
+ 
+     <dependency>
+-      <groupId>org.elasticsearch</groupId>
+-      <artifactId>elasticsearch</artifactId>
+-      <optional>true</optional>
++      <groupId>org.elasticsearch.client</groupId>
++      <artifactId>transport</artifactId>
+     </dependency>
+ 
+     <dependency>
+@@ -70,7 +69,6 @@
+     <dependency>
+       <groupId>org.apache.logging.log4j</groupId>
+       <artifactId>log4j-api</artifactId>
+-      <scope>test</scope>
+     </dependency>
+ 
+     <dependency>
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ContentBuilderUtil.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ContentBuilderUtil.java
+index 83c3ffdf2..5c8060e4f 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ContentBuilderUtil.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ContentBuilderUtil.java
+@@ -17,12 +17,11 @@
+  * under the License.
+  */
+ package org.apache.flume.sink.elasticsearch;
+-import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ 
+ import java.io.IOException;
+ import java.nio.charset.Charset;
+ 
+-import org.elasticsearch.common.jackson.core.JsonParseException;
++import org.elasticsearch.common.xcontent.NamedXContentRegistry;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.elasticsearch.common.xcontent.XContentFactory;
+ import org.elasticsearch.common.xcontent.XContentParser;
+@@ -64,16 +63,18 @@ public static void addComplexField(XContentBuilder builder, String fieldName,
+       // elasticsearch.
+       // If validation fails then the incoming event is submitted to
+       // elasticsearch as plain text.
+-      parser = XContentFactory.xContent(contentType).createParser(data);
++      parser = XContentFactory.xContent(contentType)
++          .createParser(NamedXContentRegistry.EMPTY, data);
+       while (parser.nextToken() != null) {};
+ 
+       // If the JSON is valid then include it
+-      parser = XContentFactory.xContent(contentType).createParser(data);
++      parser = XContentFactory.xContent(contentType)
++          .createParser(NamedXContentRegistry.EMPTY, data);
+       // Add the field name, but not the value.
+       builder.field(fieldName);
+       // This will add the whole parsed content as the value of the field.
+       builder.copyCurrentStructure(parser);
+-    } catch (JsonParseException ex) {
++    } catch (IOException ex) {
+       // If we get an exception here the most likely cause is nested JSON that
+       // can't be figured out in the body. At this point just push it through
+       // as is
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchDynamicSerializer.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchDynamicSerializer.java
+index aa7ad392f..792b1558f 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchDynamicSerializer.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchDynamicSerializer.java
+@@ -53,6 +53,7 @@ public XContentBuilder getContentBuilder(Event event) throws IOException {
+     XContentBuilder builder = jsonBuilder().startObject();
+     appendBody(builder, event);
+     appendHeaders(builder, event);
++    builder.endObject();
+     return builder;
+   }
+ 
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchEventSerializer.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchEventSerializer.java
+index c89d6278a..557a99b1e 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchEventSerializer.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchEventSerializer.java
+@@ -24,7 +24,8 @@
+ import org.apache.flume.Event;
+ import org.apache.flume.conf.Configurable;
+ import org.apache.flume.conf.ConfigurableComponent;
+-import org.elasticsearch.common.io.BytesStream;
++import org.elasticsearch.common.io.stream.BytesStream;
++import org.elasticsearch.common.xcontent.XContentBuilder;
+ 
+ /**
+  * Interface for an event serializer which serializes the headers and body of an
+@@ -40,9 +41,9 @@
+    * Return an {@link BytesStream} made up of the serialized flume event
+    * @param event
+    *          The flume event to serialize
+-   * @return A {@link BytesStream} used to write to ElasticSearch
++   * @return A {@link XContentBuilder} used to write to ElasticSearch
+    * @throws IOException
+    *           If an error occurs during serialization
+    */
+-  abstract BytesStream getContentBuilder(Event event) throws IOException;
++  abstract XContentBuilder getContentBuilder(Event event) throws IOException;
+ }
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchLogStashEventSerializer.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchLogStashEventSerializer.java
+index 3638368e4..ec20f152c 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchLogStashEventSerializer.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchLogStashEventSerializer.java
+@@ -29,7 +29,7 @@
+ import org.apache.flume.Context;
+ import org.apache.flume.Event;
+ import org.apache.flume.conf.ComponentConfiguration;
+-import org.elasticsearch.common.collect.Maps;
++import org.elasticsearch.common.collect.MapBuilder;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ 
+ /**
+@@ -78,6 +78,7 @@ public XContentBuilder getContentBuilder(Event event) throws IOException {
+     XContentBuilder builder = jsonBuilder().startObject();
+     appendBody(builder, event);
+     appendHeaders(builder, event);
++    builder.endObject();
+     return builder;
+   }
+ 
+@@ -89,7 +90,8 @@ private void appendBody(XContentBuilder builder, Event event)
+ 
+   private void appendHeaders(XContentBuilder builder, Event event)
+       throws IOException {
+-    Map<String, String> headers = Maps.newHashMap(event.getHeaders());
++    Map<String, String> headers = MapBuilder.<String, String>newMapBuilder()
++        .putAll(event.getHeaders()).map();
+ 
+     String timestamp = headers.get("timestamp");
+     if (!StringUtils.isBlank(timestamp)
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchSink.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchSink.java
+index ebafb9f90..b7c356549 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchSink.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchSink.java
+@@ -23,14 +23,11 @@
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.DEFAULT_CLUSTER_NAME;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.DEFAULT_INDEX_NAME;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.DEFAULT_INDEX_TYPE;
+-import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.DEFAULT_TTL;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.HOSTNAMES;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.INDEX_NAME;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.INDEX_TYPE;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.SERIALIZER;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.SERIALIZER_PREFIX;
+-import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.TTL;
+-import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.TTL_REGEX;
+ import org.apache.commons.lang.StringUtils;
+ import org.apache.flume.Channel;
+ import org.apache.flume.Context;
+@@ -51,10 +48,6 @@
+ import com.google.common.base.Preconditions;
+ import com.google.common.base.Throwables;
+ 
+-import java.util.concurrent.TimeUnit;
+-import java.util.regex.Matcher;
+-import java.util.regex.Pattern;
+-
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.CLIENT_PREFIX;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.CLIENT_TYPE;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.DEFAULT_CLIENT_TYPE;
+@@ -62,6 +55,8 @@
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.DEFAULT_SERIALIZER_CLASS;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.INDEX_NAME_BUILDER;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.INDEX_NAME_BUILDER_PREFIX;
++import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.DEFAULT_COMPRESS;
++import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.COMPRESS;
+ 
+ /**
+  * A sink which reads events from a channel and writes them to ElasticSearch
+@@ -95,14 +90,11 @@
+   private static final int defaultBatchSize = 100;
+ 
+   private int batchSize = defaultBatchSize;
+-  private long ttlMs = DEFAULT_TTL;
+   private String clusterName = DEFAULT_CLUSTER_NAME;
+   private String indexName = DEFAULT_INDEX_NAME;
+   private String indexType = DEFAULT_INDEX_TYPE;
+   private String clientType = DEFAULT_CLIENT_TYPE;
+-  private final Pattern pattern = Pattern.compile(TTL_REGEX,
+-      Pattern.CASE_INSENSITIVE);
+-  private Matcher matcher = pattern.matcher("");
++  private String compress = DEFAULT_COMPRESS;
+ 
+   private String[] serverAddresses = null;
+ 
+@@ -156,11 +148,6 @@ String getIndexType() {
+     return indexType;
+   }
+ 
+-  @VisibleForTesting
+-  long getTTLMs() {
+-    return ttlMs;
+-  }
+-
+   @VisibleForTesting
+   ElasticSearchEventSerializer getEventSerializer() {
+     return eventSerializer;
+@@ -187,7 +174,7 @@ public Status process() throws EventDeliveryException {
+           break;
+         }
+         String realIndexType = BucketPath.escapeString(indexType, event.getHeaders());
+-        client.addEvent(event, indexNameBuilder, realIndexType, ttlMs);
++        client.addEvent(event, indexNameBuilder, realIndexType);
+       }
+ 
+       if (count <= 0) {
+@@ -261,16 +248,14 @@ public void configure(Context context) {
+       this.batchSize = Integer.parseInt(context.getString(BATCH_SIZE));
+     }
+ 
+-    if (StringUtils.isNotBlank(context.getString(TTL))) {
+-      this.ttlMs = parseTTL(context.getString(TTL));
+-      Preconditions.checkState(ttlMs > 0, TTL
+-          + " must be greater than 0 or not set.");
+-    }
+-
+     if (StringUtils.isNotBlank(context.getString(CLIENT_TYPE))) {
+       clientType = context.getString(CLIENT_TYPE);
+     }
+ 
++    if (StringUtils.isNotBlank(context.getString(COMPRESS))) {
++      compress = context.getString(COMPRESS);
++    }
++
+     elasticSearchClientContext = new Context();
+     elasticSearchClientContext.putAll(context.getSubProperties(CLIENT_PREFIX));
+ 
+@@ -356,7 +341,7 @@ public void start() {
+             clientType, eventSerializer, indexRequestFactory);
+       } else {
+         client = clientFactory.getClient(clientType, serverAddresses,
+-            clusterName, eventSerializer, indexRequestFactory);
++            clusterName, eventSerializer, indexRequestFactory, compress.equalsIgnoreCase("true"));
+         client.configure(elasticSearchClientContext);
+       }
+       sinkCounter.incrementConnectionCreatedCount();
+@@ -382,47 +367,4 @@ public void stop() {
+     sinkCounter.stop();
+     super.stop();
+   }
+-
+-  /*
+-   * Returns TTL value of ElasticSearch index in milliseconds when TTL specifier
+-   * is "ms" / "s" / "m" / "h" / "d" / "w". In case of unknown specifier TTL is
+-   * not set. When specifier is not provided it defaults to days in milliseconds
+-   * where the number of days is parsed integer from TTL string provided by
+-   * user. <p> Elasticsearch supports ttl values being provided in the format:
+-   * 1d / 1w / 1ms / 1s / 1h / 1m specify a time unit like d (days), m
+-   * (minutes), h (hours), ms (milliseconds) or w (weeks), milliseconds is used
+-   * as default unit.
+-   * http://www.elasticsearch.org/guide/reference/mapping/ttl-field/.
+-   * 
+-   * @param ttl TTL value provided by user in flume configuration file for the
+-   * sink
+-   * 
+-   * @return the ttl value in milliseconds
+-   */
+-  private long parseTTL(String ttl) {
+-    matcher = matcher.reset(ttl);
+-    while (matcher.find()) {
+-      if (matcher.group(2).equals("ms")) {
+-        return Long.parseLong(matcher.group(1));
+-      } else if (matcher.group(2).equals("s")) {
+-        return TimeUnit.SECONDS.toMillis(Integer.parseInt(matcher.group(1)));
+-      } else if (matcher.group(2).equals("m")) {
+-        return TimeUnit.MINUTES.toMillis(Integer.parseInt(matcher.group(1)));
+-      } else if (matcher.group(2).equals("h")) {
+-        return TimeUnit.HOURS.toMillis(Integer.parseInt(matcher.group(1)));
+-      } else if (matcher.group(2).equals("d")) {
+-        return TimeUnit.DAYS.toMillis(Integer.parseInt(matcher.group(1)));
+-      } else if (matcher.group(2).equals("w")) {
+-        return TimeUnit.DAYS.toMillis(7 * Integer.parseInt(matcher.group(1)));
+-      } else if (matcher.group(2).equals("")) {
+-        logger.info("TTL qualifier is empty. Defaulting to day qualifier.");
+-        return TimeUnit.DAYS.toMillis(Integer.parseInt(matcher.group(1)));
+-      } else {
+-        logger.debug("Unknown TTL qualifier provided. Setting TTL to 0.");
+-        return 0;
+-      }
+-    }
+-    logger.info("TTL not provided. Skipping the TTL config by returning 0.");
+-    return 0;
+-  }
+ }
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchSinkConstants.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchSinkConstants.java
+index da88def7b..39d9175a3 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchSinkConstants.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/ElasticSearchSinkConstants.java
+@@ -53,12 +53,6 @@
+    */
+   public static final String BATCH_SIZE = "batchSize";
+ 
+-  /**
+-   * TTL in days, when set will cause the expired documents to be deleted
+-   * automatically, if not set documents will never be automatically deleted
+-   */
+-  public static final String TTL = "ttl";
+-
+   /**
+    * The fully qualified class name of the serializer the sink should use.
+    */
+@@ -93,17 +87,21 @@
+    */
+   public static final String CLIENT_PREFIX = CLIENT_TYPE + ".";
+ 
++  /**
++   * Set to true to enable compression (LZF) between all nodes
++   */
++  public static final String COMPRESS = "compress";
++
+   /**
+    * DEFAULTS USED BY THE SINK
+    */
+ 
+   public static final int DEFAULT_PORT = 9300;
+-  public static final int DEFAULT_TTL = -1;
+   public static final String DEFAULT_INDEX_NAME = "flume";
+   public static final String DEFAULT_INDEX_TYPE = "log";
+   public static final String DEFAULT_CLUSTER_NAME = "elasticsearch";
+   public static final String DEFAULT_CLIENT_TYPE = "transport";
+-  public static final String TTL_REGEX = "^(\\d+)(\\D*)";
++  public static final String DEFAULT_COMPRESS = "true";
+   public static final String DEFAULT_SERIALIZER_CLASS = "org.apache.flume." +
+           "sink.elasticsearch.ElasticSearchLogStashEventSerializer";
+   public static final String DEFAULT_INDEX_NAME_BUILDER_CLASS =
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/EventSerializerIndexRequestBuilderFactory.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/EventSerializerIndexRequestBuilderFactory.java
+index d6cca50a3..4be3f3e98 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/EventSerializerIndexRequestBuilderFactory.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/EventSerializerIndexRequestBuilderFactory.java
+@@ -25,7 +25,9 @@
+ import org.apache.flume.Event;
+ import org.apache.flume.conf.ComponentConfiguration;
+ import org.elasticsearch.action.index.IndexRequestBuilder;
+-import org.elasticsearch.common.io.BytesStream;
++import org.elasticsearch.common.io.stream.BytesStream;
++import org.elasticsearch.common.xcontent.XContentBuilder;
++import org.elasticsearch.common.xcontent.XContentType;
+ 
+ /**
+  * Default implementation of {@link ElasticSearchIndexRequestBuilderFactory}.
+@@ -61,9 +63,9 @@ public void configure(ComponentConfiguration config) {
+   @Override
+   protected void prepareIndexRequest(IndexRequestBuilder indexRequest,
+       String indexName, String indexType, Event event) throws IOException {
+-    BytesStream contentBuilder = serializer.getContentBuilder(event);
++    XContentBuilder contentBuilder = serializer.getContentBuilder(event);
+     indexRequest.setIndex(indexName)
+         .setType(indexType)
+-        .setSource(contentBuilder.bytes());
++        .setSource(contentBuilder.bytes(), XContentType.JSON);
+   }
+ }
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchClient.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchClient.java
+index 655e00ae5..f57b778a3 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchClient.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchClient.java
+@@ -42,12 +42,10 @@
+    *    Index name builder which generates name of index to feed
+    * @param indexType
+    *    Name of type of document which will be sent to the elasticsearch cluster
+-   * @param ttlMs
+-   *    Time to live expressed in milliseconds. Value <= 0 is ignored
+    * @throws Exception
+    */
+   public void addEvent(Event event, IndexNameBuilder indexNameBuilder,
+-      String indexType, long ttlMs) throws Exception;
++      String indexType) throws Exception;
+ 
+   /**
+    * Sends bulk to the elasticsearch cluster
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchClientFactory.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchClientFactory.java
+index 986fb2b8f..93514a65b 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchClientFactory.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchClientFactory.java
+@@ -39,15 +39,17 @@
+    *    Elasticsearch cluster name used only by Transport Client
+    * @param serializer
+    *    Serializer of flume events to elasticsearch documents
++   * @param compress
+    * @return
+    */
+   public ElasticSearchClient getClient(String clientType, String[] hostNames,
+       String clusterName, ElasticSearchEventSerializer serializer,
+-      ElasticSearchIndexRequestBuilderFactory indexBuilder) throws NoSuchClientTypeException {
++      ElasticSearchIndexRequestBuilderFactory indexBuilder, boolean compress)
++          throws NoSuchClientTypeException {
+     if (clientType.equalsIgnoreCase(TransportClient) && serializer != null) {
+-      return new ElasticSearchTransportClient(hostNames, clusterName, serializer);
++      return new ElasticSearchTransportClient(hostNames, clusterName, compress, serializer);
+     } else if (clientType.equalsIgnoreCase(TransportClient) && indexBuilder != null) { 
+-      return new ElasticSearchTransportClient(hostNames, clusterName, indexBuilder);
++      return new ElasticSearchTransportClient(hostNames, clusterName, compress, indexBuilder);
+     } else if (clientType.equalsIgnoreCase(RestClient) && serializer != null) {
+       return new ElasticSearchRestClient(hostNames, serializer);
+     }
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchRestClient.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchRestClient.java
+index e51efe23c..249e171dc 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchRestClient.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchRestClient.java
+@@ -50,7 +50,6 @@
+   private static final String INDEX_OPERATION_NAME = "index";
+   private static final String INDEX_PARAM = "_index";
+   private static final String TYPE_PARAM = "_type";
+-  private static final String TTL_PARAM = "_ttl";
+   private static final String BULK_ENDPOINT = "_bulk";
+ 
+   private static final Logger logger = LoggerFactory.getLogger(ElasticSearchRestClient.class);
+@@ -92,23 +91,20 @@ public void close() {
+   }
+ 
+   @Override
+-  public void addEvent(Event event, IndexNameBuilder indexNameBuilder, String indexType,
+-                       long ttlMs) throws Exception {
++  public void addEvent(Event event, IndexNameBuilder indexNameBuilder, String indexType)
++      throws Exception {
+     BytesReference content = serializer.getContentBuilder(event).bytes();
+     Map<String, Map<String, String>> parameters = new HashMap<String, Map<String, String>>();
+     Map<String, String> indexParameters = new HashMap<String, String>();
+     indexParameters.put(INDEX_PARAM, indexNameBuilder.getIndexName(event));
+     indexParameters.put(TYPE_PARAM, indexType);
+-    if (ttlMs > 0) {
+-      indexParameters.put(TTL_PARAM, Long.toString(ttlMs));
+-    }
+     parameters.put(INDEX_OPERATION_NAME, indexParameters);
+ 
+     Gson gson = new Gson();
+     synchronized (bulkBuilder) {
+       bulkBuilder.append(gson.toJson(parameters));
+       bulkBuilder.append("\n");
+-      bulkBuilder.append(content.toBytesArray().toUtf8());
++      bulkBuilder.append(content.toBytesRef().utf8ToString());
+       bulkBuilder.append("\n");
+     }
+   }
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchTransportClient.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchTransportClient.java
+index 2cf365e7b..3ebcdedf1 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchTransportClient.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/main/java/org/apache/flume/sink/elasticsearch/client/ElasticSearchTransportClient.java
+@@ -24,22 +24,27 @@
+ import org.apache.flume.Event;
+ import org.apache.flume.EventDeliveryException;
+ import org.apache.flume.sink.elasticsearch.ElasticSearchEventSerializer;
++import org.apache.flume.sink.elasticsearch.ElasticSearchIndexRequestBuilderFactory;
+ import org.apache.flume.sink.elasticsearch.IndexNameBuilder;
++import org.elasticsearch.action.admin.cluster.node.info.NodesInfoRequest;
++import org.elasticsearch.action.admin.cluster.node.info.NodesInfoResponse;
+ import org.elasticsearch.action.bulk.BulkRequestBuilder;
+ import org.elasticsearch.action.bulk.BulkResponse;
+ import org.elasticsearch.action.index.IndexRequestBuilder;
+ import org.elasticsearch.client.Client;
++import org.elasticsearch.client.support.AbstractClient;
+ import org.elasticsearch.client.transport.TransportClient;
+-import org.elasticsearch.common.settings.ImmutableSettings;
+ import org.elasticsearch.common.settings.Settings;
+-import org.elasticsearch.common.transport.InetSocketTransportAddress;
+-import org.elasticsearch.node.Node;
+-import org.elasticsearch.node.NodeBuilder;
++import org.elasticsearch.common.transport.TransportAddress;
++import org.elasticsearch.common.xcontent.XContentType;
++import org.elasticsearch.transport.client.PreBuiltTransportClient;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ 
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.UnknownHostException;
+ import java.util.Arrays;
+-import org.apache.flume.sink.elasticsearch.ElasticSearchIndexRequestBuilderFactory;
+ 
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.DEFAULT_PORT;
+ 
+@@ -48,15 +53,16 @@
+   public static final Logger logger = LoggerFactory
+       .getLogger(ElasticSearchTransportClient.class);
+ 
+-  private InetSocketTransportAddress[] serverAddresses;
++  private TransportAddress[] serverAddresses;
+   private ElasticSearchEventSerializer serializer;
+   private ElasticSearchIndexRequestBuilderFactory indexRequestBuilderFactory;
+   private BulkRequestBuilder bulkRequestBuilder;
++  private boolean openCompress = false;
+ 
+   private Client client;
+ 
+   @VisibleForTesting
+-  InetSocketTransportAddress[] getServerAddresses() {
++  TransportAddress[] getServerAddresses() {
+     return serverAddresses;
+   }
+ 
+@@ -72,17 +78,19 @@ void setBulkRequestBuilder(BulkRequestBuilder bulkRequestBuilder) {
+    * @param clusterName
+    * @param serializer
+    */
+-  public ElasticSearchTransportClient(String[] hostNames, String clusterName,
++  public ElasticSearchTransportClient(String[] hostNames, String clusterName, boolean compress,
+       ElasticSearchEventSerializer serializer) {
+     configureHostnames(hostNames);
+     this.serializer = serializer;
++    this.openCompress = compress;
+     openClient(clusterName);
+   }
+ 
+-  public ElasticSearchTransportClient(String[] hostNames, String clusterName,
++  public ElasticSearchTransportClient(String[] hostNames, String clusterName, boolean compress,
+       ElasticSearchIndexRequestBuilderFactory indexBuilder) {
+     configureHostnames(hostNames);
+     this.indexRequestBuilderFactory = indexBuilder;
++    this.openCompress = compress;
+     openClient(clusterName);
+   }
+   
+@@ -132,13 +140,13 @@ public ElasticSearchTransportClient(Client client,
+ 
+   private void configureHostnames(String[] hostNames) {
+     logger.warn(Arrays.toString(hostNames));
+-    serverAddresses = new InetSocketTransportAddress[hostNames.length];
++    serverAddresses = new TransportAddress[hostNames.length];
+     for (int i = 0; i < hostNames.length; i++) {
+       String[] hostPort = hostNames[i].trim().split(":");
+       String host = hostPort[0].trim();
+       int port = hostPort.length == 2 ? Integer.parseInt(hostPort[1].trim())
+               : DEFAULT_PORT;
+-      serverAddresses[i] = new InetSocketTransportAddress(host, port);
++      serverAddresses[i] = new TransportAddress(new InetSocketAddress(host, port));
+     }
+   }
+   
+@@ -152,7 +160,7 @@ public void close() {
+ 
+   @Override
+   public void addEvent(Event event, IndexNameBuilder indexNameBuilder,
+-      String indexType, long ttlMs) throws Exception {
++      String indexType) throws Exception {
+     if (bulkRequestBuilder == null) {
+       bulkRequestBuilder = client.prepareBulk();
+     }
+@@ -161,15 +169,12 @@ public void addEvent(Event event, IndexNameBuilder indexNameBuilder,
+     if (indexRequestBuilderFactory == null) {
+       indexRequestBuilder = client
+           .prepareIndex(indexNameBuilder.getIndexName(event), indexType)
+-          .setSource(serializer.getContentBuilder(event).bytes());
++          .setSource(serializer.getContentBuilder(event).bytes(), XContentType.JSON);
+     } else {
+       indexRequestBuilder = indexRequestBuilderFactory.createIndexRequest(
+           client, indexNameBuilder.getIndexPrefix(event), indexType, event);
+     }
+ 
+-    if (ttlMs > 0) {
+-      indexRequestBuilder.setTTL(ttlMs);
+-    }
+     bulkRequestBuilder.add(indexRequestBuilder);
+   }
+ 
+@@ -193,11 +198,16 @@ public void execute() throws Exception {
+   private void openClient(String clusterName) {
+     logger.info("Using ElasticSearch hostnames: {} ",
+         Arrays.toString(serverAddresses));
+-    Settings settings = ImmutableSettings.settingsBuilder()
+-        .put("cluster.name", clusterName).build();
++    Settings.Builder settingsBuilder = Settings.builder()
++        .put("cluster.name", clusterName);
++    if (openCompress) {
++      logger.info("Open compress option for transport client.");
++      settingsBuilder.put("transport.tcp.compress", true);
++    }
+ 
+-    TransportClient transportClient = new TransportClient(settings);
+-    for (InetSocketTransportAddress host : serverAddresses) {
++    Settings settings = settingsBuilder.build();
++    TransportClient transportClient = new PreBuiltTransportClient(settings);
++    for (TransportAddress host : serverAddresses) {
+       transportClient.addTransportAddress(host);
+     }
+     if (client != null) {
+@@ -213,12 +223,39 @@ private void openClient(String clusterName) {
+    * in the same JVM
+    */
+   private void openLocalDiscoveryClient() {
+-    logger.info("Using ElasticSearch AutoDiscovery mode");
+-    Node node = NodeBuilder.nodeBuilder().client(true).local(true).node();
++    // use local node created in AbstractElasticSearchSinkTest.class
++    // which is 127.0.0.1:9200
++    Settings settings = Settings.builder()
++            .put("cluster.name", "test")
++            .build();
+     if (client != null) {
+       client.close();
+     }
+-    client = node.client();
++    findNodeAddress();
++    try {
++      client = new PreBuiltTransportClient(settings).addTransportAddress(
++              new TransportAddress(InetAddress.getByName(host), port));
++    } catch (UnknownHostException e) {
++      e.printStackTrace();
++    }
++  }
++
++  private String host;
++  private int port;
++  // FOR TESTING
++  public static AbstractClient testClient;
++
++  private void findNodeAddress() {
++    NodesInfoRequest nodesInfoRequest = new NodesInfoRequest().transport(true);
++    NodesInfoResponse response = testClient.admin().cluster()
++        .nodesInfo(nodesInfoRequest).actionGet();
++    TransportAddress address = response.getNodes().iterator().next().getTransport().getAddress()
++            .publishAddress();
++    host = address.getAddress();
++    port = address.getPort();
++    if (host == null) {
++      throw new IllegalArgumentException("host not found");
++    }
+   }
+ 
+   @Override
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/AbstractElasticSearchSinkTest.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/AbstractElasticSearchSinkTest.java
+index 9fbd7474b..5f0f894cf 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/AbstractElasticSearchSinkTest.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/AbstractElasticSearchSinkTest.java
+@@ -23,19 +23,18 @@
+ import org.apache.flume.Event;
+ import org.apache.flume.channel.MemoryChannel;
+ import org.apache.flume.conf.Configurables;
++import org.apache.flume.sink.elasticsearch.client.ElasticSearchTransportClient;
+ import org.elasticsearch.action.search.SearchResponse;
+ import org.elasticsearch.client.Client;
+-import org.elasticsearch.common.collect.Maps;
+-import org.elasticsearch.common.settings.ImmutableSettings;
++import org.elasticsearch.client.support.AbstractClient;
++import org.elasticsearch.common.collect.MapBuilder;
+ import org.elasticsearch.common.settings.Settings;
+-import org.elasticsearch.gateway.Gateway;
+ import org.elasticsearch.index.query.QueryBuilder;
+ import org.elasticsearch.index.query.QueryBuilders;
+ import org.elasticsearch.node.Node;
+-import org.elasticsearch.node.NodeBuilder;
+-import org.elasticsearch.node.internal.InternalNode;
+ import org.elasticsearch.search.SearchHit;
+ import org.elasticsearch.search.SearchHits;
++import org.elasticsearch.transport.Netty4Plugin;
+ import org.joda.time.DateTimeUtils;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -43,12 +42,12 @@
+ import java.util.Arrays;
+ import java.util.Comparator;
+ import java.util.Map;
++import java.util.UUID;
+ 
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.BATCH_SIZE;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.CLUSTER_NAME;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.INDEX_NAME;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.INDEX_TYPE;
+-import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.TTL;
+ import static org.junit.Assert.assertEquals;
+ 
+ public abstract class AbstractElasticSearchSinkTest {
+@@ -64,36 +63,43 @@
+   Map<String, String> parameters;
+ 
+   void initDefaults() {
+-    parameters = Maps.newHashMap();
++    parameters = MapBuilder.<String, String>newMapBuilder().map();
+     parameters.put(INDEX_NAME, DEFAULT_INDEX_NAME);
+     parameters.put(INDEX_TYPE, DEFAULT_INDEX_TYPE);
+     parameters.put(CLUSTER_NAME, DEFAULT_CLUSTER_NAME);
+     parameters.put(BATCH_SIZE, "1");
+-    parameters.put(TTL, "5");
+ 
+     timestampedIndexName = DEFAULT_INDEX_NAME + '-'
+         + ElasticSearchIndexRequestBuilderFactory.df.format(FIXED_TIME_MILLIS);
+   }
+ 
+   void createNodes() throws Exception {
+-    Settings settings = ImmutableSettings
+-        .settingsBuilder()
+-        .put("number_of_shards", 1)
+-        .put("number_of_replicas", 0)
+-        .put("routing.hash.type", "simple")
+-        .put("gateway.type", "none")
+-        .put("path.data", "target/es-test")
++    String hostname = "localhost";
++    Settings settings = Settings.builder()
++        .put("cluster.name", "test")
++        // required to build a cluster, replica tests will test this.
++        .put("discovery.zen.ping.unicast.hosts", hostname)
++        .put("transport.type", Netty4Plugin.NETTY_TRANSPORT_NAME)
++        .put("network.host", hostname)
++        .put("http.enabled", false)
++        .put("path.home", "target/es-test" + UUID.randomUUID())
++        // maximum five nodes on same host
++        .put("node.max_local_storage_nodes", 5)
++        .put("thread_pool.bulk.size", Runtime.getRuntime().availableProcessors())
++        // default is 50 which is too low
++        .put("thread_pool.bulk.queue_size", 16 * Runtime.getRuntime().availableProcessors())
+         .build();
+ 
+-    node = NodeBuilder.nodeBuilder().settings(settings).local(true).node();
++    node = new MockNode(settings, Netty4Plugin.class);
++    node.start();
+     client = node.client();
+ 
++    ElasticSearchTransportClient.testClient = (AbstractClient) client;
+     client.admin().cluster().prepareHealth().setWaitForGreenStatus().execute()
+         .actionGet();
+   }
+ 
+   void shutdownNodes() throws Exception {
+-    ((InternalNode) node).injector().getInstance(Gateway.class).reset();
+     client.close();
+     node.close();
+   }
+@@ -127,7 +133,7 @@ void assertMatchAllQuery(int expectedHits, Event... events) {
+   void assertBodyQuery(int expectedHits, Event... events) {
+     // Perform Multi Field Match
+     assertSearch(expectedHits,
+-        performSearch(QueryBuilders.fieldQuery("@message", "event")),
++        performSearch(QueryBuilders.matchQuery("@message", "event")),
+         null, events);
+   }
+ 
+@@ -152,7 +158,7 @@ public int compare(SearchHit o1, SearchHit o2) {
+     for (int i = 0; i < events.length; i++) {
+       Event event = events[i];
+       SearchHit hit = hits[i];
+-      Map<String, Object> source = hit.getSource();
++      Map<String, Object> source = hit.getSourceAsMap();
+       if (expectedBody == null) {
+         assertEquals(new String(event.getBody()), source.get("@message"));
+       } else {
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/MockNode.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/MockNode.java
+new file mode 100644
+index 000000000..c994bb922
+--- /dev/null
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/MockNode.java
+@@ -0,0 +1,59 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.flume.sink.elasticsearch;
++
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.node.Node;
++import org.elasticsearch.node.InternalSettingsPreparer;
++import org.elasticsearch.plugins.Plugin;
++
++import java.util.ArrayList;
++import java.util.Collection;
++
++/**
++ * This MockNode for Test
++ *
++ * @author yonghaoz1994@gmail.com
++ */
++
++public class MockNode extends Node {
++
++  public MockNode() {
++    super(Settings.EMPTY);
++  }
++
++  public MockNode(Settings settings) {
++    super(settings);
++  }
++
++  public MockNode(Settings settings, Class<? extends Plugin> classpathPlugin) {
++    this(settings, list(classpathPlugin));
++  }
++
++  public MockNode(Settings settings, Collection<Class<? extends Plugin>> classpathPlugins) {
++    super(InternalSettingsPreparer.prepareEnvironment(settings, null), classpathPlugins);
++  }
++
++  private static Collection<Class<? extends Plugin>> list(Class<? extends Plugin> classpathPlugin) {
++    Collection<Class<? extends Plugin>> list = new ArrayList<>();
++    list.add(classpathPlugin);
++    return list;
++  }
++
++}
+\ No newline at end of file
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchDynamicSerializer.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchDynamicSerializer.java
+index d4e465477..1ed2647bd 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchDynamicSerializer.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchDynamicSerializer.java
+@@ -21,7 +21,7 @@
+ import org.apache.flume.Context;
+ import org.apache.flume.Event;
+ import org.apache.flume.event.EventBuilder;
+-import org.elasticsearch.common.collect.Maps;
++import org.elasticsearch.common.collect.MapBuilder;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.junit.Test;
+ 
+@@ -40,7 +40,7 @@ public void testRoundTrip() throws Exception {
+     fixture.configure(context);
+ 
+     String message = "test body";
+-    Map<String, String> headers = Maps.newHashMap();
++    Map<String, String> headers = MapBuilder.<String, String>newMapBuilder().map();
+     headers.put("headerNameOne", "headerValueOne");
+     headers.put("headerNameTwo", "headerValueTwo");
+     headers.put("headerNameThree", "headerValueThree");
+@@ -57,8 +57,8 @@ public void testRoundTrip() throws Exception {
+ 
+     XContentBuilder actual = fixture.getContentBuilder(event);
+ 
+-    assertEquals(new String(expected.bytes().array()), new String(actual
+-        .bytes().array()));
++    assertEquals(expected.bytes().utf8ToString(), actual
++            .bytes().utf8ToString());
+ 
+   }
+ }
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchIndexRequestBuilderFactory.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchIndexRequestBuilderFactory.java
+index b62254e9c..220165df7 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchIndexRequestBuilderFactory.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchIndexRequestBuilderFactory.java
+@@ -24,26 +24,33 @@
+ import org.apache.flume.conf.ComponentConfiguration;
+ import org.apache.flume.conf.sink.SinkConfiguration;
+ import org.apache.flume.event.SimpleEvent;
++import org.elasticsearch.action.index.IndexAction;
+ import org.elasticsearch.action.index.IndexRequestBuilder;
+ import org.elasticsearch.client.Client;
+-import org.elasticsearch.common.io.BytesStream;
+-import org.elasticsearch.common.io.FastByteArrayOutputStream;
++import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.xcontent.XContentBuilder;
++import org.elasticsearch.transport.client.PreBuiltTransportClient;
+ import org.junit.Before;
+ import org.junit.Test;
++import org.mockito.internal.matchers.Matches;
+ 
+ import java.io.IOException;
++import java.util.Arrays;
++import java.util.Locale;
+ import java.util.Map;
+ 
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.assertThat;
+ 
+ public class TestElasticSearchIndexRequestBuilderFactory
+     extends AbstractElasticSearchSinkTest {
+ 
+-  private static final Client FAKE_CLIENT = null;
++  private static final Client FAKE_CLIENT = new PreBuiltTransportClient(Settings.EMPTY);
+ 
+   private EventSerializerIndexRequestBuilderFactory factory;
+ 
+@@ -55,15 +62,16 @@ public void setupFactory() throws Exception {
+     factory = new EventSerializerIndexRequestBuilderFactory(serializer) {
+       @Override
+       IndexRequestBuilder prepareIndex(Client client) {
+-        return new IndexRequestBuilder(FAKE_CLIENT);
++        return new IndexRequestBuilder(FAKE_CLIENT, IndexAction.INSTANCE);
+       }
+     };
+   }
+ 
+   @Test
+   public void shouldUseUtcAsBasisForDateFormat() {
++    // use Locale.ENGLISH to ensure this test can pass on other Locales (eg. China)
+     assertEquals("Coordinated Universal Time",
+-        factory.fastDateFormat.getTimeZone().getDisplayName());
++        factory.fastDateFormat.getTimeZone().getDisplayName(Locale.ENGLISH));
+   }
+ 
+   @Test
+@@ -136,8 +144,9 @@ public void shouldSetIndexNameTypeAndSerializedEventIntoIndexRequest()
+         + ElasticSearchIndexRequestBuilderFactory.df.format(FIXED_TIME_MILLIS),
+         indexRequestBuilder.request().index());
+     assertEquals(indexType, indexRequestBuilder.request().type());
+-    assertArrayEquals(FakeEventSerializer.FAKE_BYTES,
+-        indexRequestBuilder.request().source().array());
++
++    assertThat(new String(indexRequestBuilder.request().source().toBytesRef().bytes),
++        new Matches(".*@message.*"));
+   }
+ 
+   @Test
+@@ -195,10 +204,11 @@ public void shouldConfigureEventSerializer() throws Exception {
+     boolean configuredWithComponentConfiguration;
+ 
+     @Override
+-    public BytesStream getContentBuilder(Event event) throws IOException {
+-      FastByteArrayOutputStream fbaos = new FastByteArrayOutputStream(4);
+-      fbaos.write(FAKE_BYTES);
+-      return fbaos;
++    public XContentBuilder getContentBuilder(Event event) throws IOException {
++      XContentBuilder builder = jsonBuilder().startObject();
++      ContentBuilderUtil.appendField(builder, "@message", FAKE_BYTES);
++      builder.endObject();
++      return builder;
+     }
+ 
+     @Override
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchLogStashEventSerializer.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchLogStashEventSerializer.java
+index 65b4dabab..afaf6eef6 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchLogStashEventSerializer.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchLogStashEventSerializer.java
+@@ -22,7 +22,7 @@
+ import org.apache.flume.Context;
+ import org.apache.flume.Event;
+ import org.apache.flume.event.EventBuilder;
+-import org.elasticsearch.common.collect.Maps;
++import org.elasticsearch.common.collect.MapBuilder;
+ import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.junit.Test;
+ 
+@@ -42,7 +42,7 @@ public void testRoundTrip() throws Exception {
+     fixture.configure(context);
+ 
+     String message = "test body";
+-    Map<String, String> headers = Maps.newHashMap();
++    Map<String, String> headers = MapBuilder.<String, String>newMapBuilder().map();
+     long timestamp = System.currentTimeMillis();
+     headers.put("timestamp", String.valueOf(timestamp));
+     headers.put("source", "flume_tail_src");
+@@ -87,7 +87,7 @@ public void shouldHandleInvalidJSONDuringComplexParsing() throws Exception {
+     fixture.configure(context);
+ 
+     String message = "{flume: somethingnotvalid}";
+-    Map<String, String> headers = Maps.newHashMap();
++    Map<String, String> headers = MapBuilder.<String, String>newMapBuilder().map();
+     long timestamp = System.currentTimeMillis();
+     headers.put("timestamp", String.valueOf(timestamp));
+     headers.put("source", "flume_tail_src");
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchSink.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchSink.java
+index 69acc0699..813ab1f61 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchSink.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TestElasticSearchSink.java
+@@ -30,9 +30,8 @@
+ import org.apache.flume.event.EventBuilder;
+ import org.elasticsearch.action.index.IndexRequestBuilder;
+ import org.elasticsearch.client.Requests;
+-import org.elasticsearch.common.UUID;
+-import org.elasticsearch.common.io.BytesStream;
+-import org.elasticsearch.common.io.FastByteArrayOutputStream;
++import org.elasticsearch.common.xcontent.XContentBuilder;
++import org.elasticsearch.common.xcontent.XContentType;
+ import org.elasticsearch.index.query.QueryBuilders;
+ import org.junit.After;
+ import org.junit.Before;
+@@ -42,7 +41,7 @@
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.TimeZone;
+-import java.util.concurrent.TimeUnit;
++import java.util.UUID;
+ 
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.BATCH_SIZE;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.CLUSTER_NAME;
+@@ -50,7 +49,7 @@
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.INDEX_NAME;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.INDEX_TYPE;
+ import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.SERIALIZER;
+-import static org.apache.flume.sink.elasticsearch.ElasticSearchSinkConstants.TTL;
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ import static org.junit.Assert.assertArrayEquals;
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNull;
+@@ -118,13 +117,13 @@ public void shouldIndexInvalidComplexJsonBody() throws Exception {
+ 
+     assertMatchAllQuery(3);
+     assertSearch(1,
+-        performSearch(QueryBuilders.fieldQuery("@message", "TEST1")),
++        performSearch(QueryBuilders.matchQuery("@message", "TEST1")),
+         null, event1);
+     assertSearch(1,
+-        performSearch(QueryBuilders.fieldQuery("@message", "TEST2")),
++        performSearch(QueryBuilders.matchQuery("@message", "TEST2")),
+         null, event2);
+     assertSearch(1,
+-        performSearch(QueryBuilders.fieldQuery("@message", "TEST3")),
++        performSearch(QueryBuilders.matchQuery("@message", "TEST3")),
+         null, event3);
+   }
+ 
+@@ -153,7 +152,7 @@ public void shouldIndexComplexJsonEvent() throws Exception {
+     assertSearch(1,
+         performSearch(QueryBuilders.matchAllQuery()), expectedBody, event);
+     assertSearch(1,
+-        performSearch(QueryBuilders.fieldQuery("@message.event", "json")),
++        performSearch(QueryBuilders.matchQuery("@message.event", "json")),
+         expectedBody, event);
+   }
+ 
+@@ -229,7 +228,6 @@ public void shouldParseConfiguration() {
+     parameters.put(CLUSTER_NAME, "testing-cluster-name");
+     parameters.put(INDEX_NAME, "testing-index-name");
+     parameters.put(INDEX_TYPE, "testing-index-type");
+-    parameters.put(TTL, "10");
+ 
+     fixture = new ElasticSearchSink();
+     fixture.configure(new Context(parameters));
+@@ -239,7 +237,6 @@ public void shouldParseConfiguration() {
+     assertEquals("testing-cluster-name", fixture.getClusterName());
+     assertEquals("testing-index-name", fixture.getIndexName());
+     assertEquals("testing-index-type", fixture.getIndexType());
+-    assertEquals(TimeUnit.DAYS.toMillis(10), fixture.getTTLMs());
+     assertArrayEquals(expected, fixture.getServerAddresses());
+   }
+ 
+@@ -321,7 +318,7 @@ public void shouldAllowCustomElasticSearchIndexRequestBuilderFactory()
+     Channel channel = bindAndStartChannel(fixture);
+     Transaction tx = channel.getTransaction();
+     tx.begin();
+-    String body = "{ foo: \"bar\" }";
++    String body = "{ \"foo\": \"bar\" }";
+     Event event = EventBuilder.withBody(body.getBytes());
+     channel.put(event);
+     tx.commit();
+@@ -339,37 +336,6 @@ public void shouldAllowCustomElasticSearchIndexRequestBuilderFactory()
+     assertTrue(CustomElasticSearchIndexRequestBuilderFactory.hasContext);
+   }
+ 
+-  @Test
+-  public void shouldParseFullyQualifiedTTLs() {
+-    Map<String, Long> testTTLMap = new HashMap<String, Long>();
+-    testTTLMap.put("1ms", Long.valueOf(1));
+-    testTTLMap.put("1s", Long.valueOf(1000));
+-    testTTLMap.put("1m", Long.valueOf(60000));
+-    testTTLMap.put("1h", Long.valueOf(3600000));
+-    testTTLMap.put("1d", Long.valueOf(86400000));
+-    testTTLMap.put("1w", Long.valueOf(604800000));
+-    testTTLMap.put("1", Long.valueOf(86400000));
+-
+-    parameters.put(HOSTNAMES, "10.5.5.27");
+-    parameters.put(CLUSTER_NAME, "testing-cluster-name");
+-    parameters.put(INDEX_NAME, "testing-index-name");
+-    parameters.put(INDEX_TYPE, "testing-index-type");
+-
+-    for (String ttl : testTTLMap.keySet()) {
+-      parameters.put(TTL, ttl);
+-      fixture = new ElasticSearchSink();
+-      fixture.configure(new Context(parameters));
+-
+-      String[] expected = { "10.5.5.27" };
+-      assertEquals("testing-cluster-name", fixture.getClusterName());
+-      assertEquals("testing-index-name", fixture.getIndexName());
+-      assertEquals("testing-index-type", fixture.getIndexType());
+-      assertEquals((long) testTTLMap.get(ttl), fixture.getTTLMs());
+-      assertArrayEquals(expected, fixture.getServerAddresses());
+-
+-    }
+-  }
+-
+   public static final class CustomElasticSearchIndexRequestBuilderFactory
+       extends AbstractElasticSearchIndexRequestBuilderFactory {
+ 
+@@ -388,7 +354,9 @@ protected void prepareIndexRequest(IndexRequestBuilder indexRequest, String inde
+       actualIndexName = indexName;
+       actualIndexType = indexType;
+       actualEventBody = event.getBody();
+-      indexRequest.setIndex(indexName).setType(indexType).setSource(event.getBody());
++      indexRequest.setIndex(indexName)
++        .setType(indexType)
++        .setSource(event.getBody(), XContentType.JSON);
+     }
+ 
+     @Override
+@@ -461,10 +429,11 @@ public void configure(Context arg0) {
+   boolean configuredWithComponentConfiguration;
+ 
+   @Override
+-  public BytesStream getContentBuilder(Event event) throws IOException {
+-    FastByteArrayOutputStream fbaos = new FastByteArrayOutputStream(4);
+-    fbaos.write(FAKE_BYTES);
+-    return fbaos;
++  public XContentBuilder getContentBuilder(Event event) throws IOException {
++    XContentBuilder builder = jsonBuilder().startObject();
++    ContentBuilderUtil.appendField(builder, "@message", FAKE_BYTES);
++    builder.endObject();
++    return builder;
+   }
+ 
+   @Override
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TimeBasedIndexNameBuilderTest.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TimeBasedIndexNameBuilderTest.java
+index 678342a18..0fd717e26 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TimeBasedIndexNameBuilderTest.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/TimeBasedIndexNameBuilderTest.java
+@@ -25,6 +25,7 @@
+ import org.junit.Test;
+ 
+ import java.util.HashMap;
++import java.util.Locale;
+ import java.util.Map;
+ 
+ import static org.junit.Assert.assertEquals;
+@@ -44,7 +45,7 @@ public void setUp() throws Exception {
+   @Test
+   public void shouldUseUtcAsBasisForDateFormat() {
+     assertEquals("Coordinated Universal Time",
+-            indexNameBuilder.getFastDateFormat().getTimeZone().getDisplayName());
++            indexNameBuilder.getFastDateFormat().getTimeZone().getDisplayName(Locale.ENGLISH));
+   }
+ 
+   @Test
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchClientFactory.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchClientFactory.java
+index c3f07b05e..56fcf4092 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchClientFactory.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchClientFactory.java
+@@ -44,7 +44,7 @@ public void setUp() {
+   public void shouldReturnTransportClient() throws Exception {
+     String[] hostNames = { "127.0.0.1" };
+     Object o = factory.getClient(ElasticSearchClientFactory.TransportClient,
+-                                 hostNames, "test", serializer, null);
++                                 hostNames, "test", serializer, null, false);
+     assertThat(o, instanceOf(ElasticSearchTransportClient.class));
+   }
+ 
+@@ -52,13 +52,13 @@ public void shouldReturnTransportClient() throws Exception {
+   public void shouldReturnRestClient() throws NoSuchClientTypeException {
+     String[] hostNames = { "127.0.0.1" };
+     Object o = factory.getClient(ElasticSearchClientFactory.RestClient,
+-                                 hostNames, "test", serializer, null);
++                                 hostNames, "test", serializer, null, false);
+     assertThat(o, instanceOf(ElasticSearchRestClient.class));
+   }
+ 
+   @Test(expected = NoSuchClientTypeException.class)
+   public void shouldThrowNoSuchClientTypeException() throws NoSuchClientTypeException {
+     String[] hostNames = { "127.0.0.1" };
+-    factory.getClient("not_existing_client", hostNames, "test", null, null);
++    factory.getClient("not_existing_client", hostNames, "test", null, null, false);
+   }
+ }
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchRestClient.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchRestClient.java
+index 9551c8163..1f4f2beb2 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchRestClient.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchRestClient.java
+@@ -23,6 +23,7 @@
+ import com.google.gson.JsonParser;
+ import org.apache.flume.Event;
+ import org.apache.flume.EventDeliveryException;
++import org.apache.flume.sink.elasticsearch.ContentBuilderUtil;
+ import org.apache.flume.sink.elasticsearch.ElasticSearchEventSerializer;
+ import org.apache.flume.sink.elasticsearch.IndexNameBuilder;
+ import org.apache.http.HttpEntity;
+@@ -33,9 +34,10 @@
+ import org.apache.http.client.methods.HttpPost;
+ import org.apache.http.client.methods.HttpUriRequest;
+ import org.apache.http.util.EntityUtils;
+-import org.elasticsearch.common.bytes.BytesArray;
++import org.apache.lucene.util.BytesRef;
+ import org.elasticsearch.common.bytes.BytesReference;
+-import org.elasticsearch.common.io.BytesStream;
++import org.elasticsearch.common.io.stream.BytesStream;
++import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.mockito.ArgumentCaptor;
+@@ -47,6 +49,7 @@
+ 
+ import static junit.framework.Assert.assertEquals;
+ import static junit.framework.Assert.assertTrue;
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ import static org.mockito.Mockito.any;
+ import static org.mockito.Mockito.isA;
+ import static org.mockito.Mockito.mock;
+@@ -83,59 +86,24 @@
+   private static final String INDEX_NAME = "foo_index";
+   private static final String MESSAGE_CONTENT = "{\"body\":\"test\"}";
+   private static final String[] HOSTS = {"host1", "host2"};
++  private static final byte[] FAKE_BYTES = new byte[]{9, 8, 7, 6};
+ 
+   @Before
+   public void setUp() throws IOException {
+     initMocks(this);
+     BytesReference bytesReference = mock(BytesReference.class);
+     BytesStream bytesStream = mock(BytesStream.class);
++    XContentBuilder builder = jsonBuilder().startObject();
++    ContentBuilderUtil.appendField(builder, "@message", FAKE_BYTES);
++    builder.endObject();
+ 
+     when(nameBuilder.getIndexName(any(Event.class))).thenReturn(INDEX_NAME);
+-    when(bytesReference.toBytesArray()).thenReturn(new BytesArray(MESSAGE_CONTENT));
++    when(bytesReference.toBytesRef()).thenReturn(new BytesRef(MESSAGE_CONTENT));
+     when(bytesStream.bytes()).thenReturn(bytesReference);
+-    when(serializer.getContentBuilder(any(Event.class))).thenReturn(bytesStream);
++    when(serializer.getContentBuilder(any(Event.class))).thenReturn(builder);
+     fixture = new ElasticSearchRestClient(HOSTS, serializer, httpClient);
+   }
+ 
+-  @Test
+-  public void shouldAddNewEventWithoutTTL() throws Exception {
+-    ArgumentCaptor<HttpPost> argument = ArgumentCaptor.forClass(HttpPost.class);
+-
+-    when(httpStatus.getStatusCode()).thenReturn(HttpStatus.SC_OK);
+-    when(httpResponse.getStatusLine()).thenReturn(httpStatus);
+-    when(httpClient.execute(any(HttpUriRequest.class))).thenReturn(httpResponse);
+-    
+-    fixture.addEvent(event, nameBuilder, "bar_type", -1);
+-    fixture.execute();
+-
+-    verify(httpClient).execute(isA(HttpUriRequest.class));
+-    verify(httpClient).execute(argument.capture());
+-
+-    assertEquals("http://host1/_bulk", argument.getValue().getURI().toString());
+-    assertTrue(verifyJsonEvents("{\"index\":{\"_type\":\"bar_type\", \"_index\":\"foo_index\"}}\n",
+-            MESSAGE_CONTENT, EntityUtils.toString(argument.getValue().getEntity())));
+-  }
+-
+-  @Test
+-  public void shouldAddNewEventWithTTL() throws Exception {
+-    ArgumentCaptor<HttpPost> argument = ArgumentCaptor.forClass(HttpPost.class);
+-
+-    when(httpStatus.getStatusCode()).thenReturn(HttpStatus.SC_OK);
+-    when(httpResponse.getStatusLine()).thenReturn(httpStatus);
+-    when(httpClient.execute(any(HttpUriRequest.class))).thenReturn(httpResponse);
+-
+-    fixture.addEvent(event, nameBuilder, "bar_type", 123);
+-    fixture.execute();
+-
+-    verify(httpClient).execute(isA(HttpUriRequest.class));
+-    verify(httpClient).execute(argument.capture());
+-
+-    assertEquals("http://host1/_bulk", argument.getValue().getURI().toString());
+-    assertTrue(verifyJsonEvents(
+-        "{\"index\":{\"_type\":\"bar_type\",\"_index\":\"foo_index\",\"_ttl\":\"123\"}}\n",
+-        MESSAGE_CONTENT, EntityUtils.toString(argument.getValue().getEntity())));
+-  }
+-
+   private boolean verifyJsonEvents(String expectedIndex, String expectedBody, String actual) {
+     Iterator<String> it = Splitter.on("\n").split(actual).iterator();
+     JsonParser parser = new JsonParser();
+@@ -154,7 +122,7 @@ public void shouldThrowEventDeliveryException() throws Exception {
+     when(httpResponse.getStatusLine()).thenReturn(httpStatus);
+     when(httpClient.execute(any(HttpUriRequest.class))).thenReturn(httpResponse);
+ 
+-    fixture.addEvent(event, nameBuilder, "bar_type", 123);
++    fixture.addEvent(event, nameBuilder, "bar_type");
+     fixture.execute();
+   }
+ 
+@@ -167,7 +135,7 @@ public void shouldRetryBulkOperation() throws Exception {
+     when(httpResponse.getStatusLine()).thenReturn(httpStatus);
+     when(httpClient.execute(any(HttpUriRequest.class))).thenReturn(httpResponse);
+ 
+-    fixture.addEvent(event, nameBuilder, "bar_type", 123);
++    fixture.addEvent(event, nameBuilder, "bar_type");
+     fixture.execute();
+ 
+     verify(httpClient, times(2)).execute(isA(HttpUriRequest.class));
+diff --git a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchTransportClient.java b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchTransportClient.java
+index b7b8e74fc..97dd176da 100644
+--- a/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchTransportClient.java
++++ b/flume-ng-sinks/flume-ng-elasticsearch-sink/src/test/java/org/apache/flume/sink/elasticsearch/client/TestElasticSearchTransportClient.java
+@@ -20,24 +20,30 @@
+ 
+ import org.apache.flume.Event;
+ import org.apache.flume.EventDeliveryException;
++import org.apache.flume.sink.elasticsearch.ContentBuilderUtil;
+ import org.apache.flume.sink.elasticsearch.ElasticSearchEventSerializer;
+ import org.apache.flume.sink.elasticsearch.IndexNameBuilder;
++import org.apache.lucene.util.BytesRef;
+ import org.elasticsearch.action.ListenableActionFuture;
+ import org.elasticsearch.action.bulk.BulkRequestBuilder;
+ import org.elasticsearch.action.bulk.BulkResponse;
+ import org.elasticsearch.action.index.IndexRequestBuilder;
+ import org.elasticsearch.client.Client;
+ import org.elasticsearch.common.bytes.BytesReference;
+-import org.elasticsearch.common.io.BytesStream;
++import org.elasticsearch.common.io.stream.BytesStream;
++import org.elasticsearch.common.xcontent.XContentBuilder;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.mockito.Mock;
+ 
+ import java.io.IOException;
+ 
++import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+ import static org.mockito.Matchers.any;
+ import static org.mockito.Matchers.anyString;
+-import static org.mockito.Mockito.*;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
+ import static org.mockito.MockitoAnnotations.initMocks;
+ 
+ public class TestElasticSearchTransportClient {
+@@ -67,12 +73,16 @@ public void setUp() throws IOException {
+     initMocks(this);
+     BytesReference bytesReference = mock(BytesReference.class);
+     BytesStream bytesStream = mock(BytesStream.class);
++    byte[] FAKE_BYTES = new byte[]{9, 8, 7, 6};
++    XContentBuilder builder = jsonBuilder().startObject();
++    ContentBuilderUtil.appendField(builder, "@message", FAKE_BYTES);
++    builder.endObject();
+ 
+     when(nameBuilder.getIndexName(any(Event.class))).thenReturn("foo_index");
+-    when(bytesReference.toBytes()).thenReturn("{\"body\":\"test\"}".getBytes());
++    when(bytesReference.toBytesRef()).thenReturn(new BytesRef("{\"body\":\"test\"}".getBytes()));
+     when(bytesStream.bytes()).thenReturn(bytesReference);
+     when(serializer.getContentBuilder(any(Event.class)))
+-        .thenReturn(bytesStream);
++        .thenReturn(builder);
+     when(elasticSearchClient.prepareIndex(anyString(), anyString()))
+         .thenReturn(indexRequestBuilder);
+     when(indexRequestBuilder.setSource(bytesReference)).thenReturn(
+@@ -82,21 +92,6 @@ public void setUp() throws IOException {
+     fixture.setBulkRequestBuilder(bulkRequestBuilder);
+   }
+ 
+-  @Test
+-  public void shouldAddNewEventWithoutTTL() throws Exception {
+-    fixture.addEvent(event, nameBuilder, "bar_type", -1);
+-    verify(indexRequestBuilder).setSource(
+-        serializer.getContentBuilder(event).bytes());
+-    verify(bulkRequestBuilder).add(indexRequestBuilder);
+-  }
+-
+-  @Test
+-  public void shouldAddNewEventWithTTL() throws Exception {
+-    fixture.addEvent(event, nameBuilder, "bar_type", 10);
+-    verify(indexRequestBuilder).setTTL(10);
+-    verify(indexRequestBuilder).setSource(
+-        serializer.getContentBuilder(event).bytes());
+-  }
+ 
+   @Test
+   public void shouldExecuteBulkRequestBuilder() throws Exception {
+@@ -107,7 +102,7 @@ public void shouldExecuteBulkRequestBuilder() throws Exception {
+     when(action.actionGet()).thenReturn(response);
+     when(response.hasFailures()).thenReturn(false);
+ 
+-    fixture.addEvent(event, nameBuilder, "bar_type", 10);
++    fixture.addEvent(event, nameBuilder, "bar_type");
+     fixture.execute();
+     verify(bulkRequestBuilder).execute();
+   }
+@@ -121,7 +116,7 @@ public void shouldThrowExceptionOnExecuteFailed() throws Exception {
+     when(action.actionGet()).thenReturn(response);
+     when(response.hasFailures()).thenReturn(true);
+ 
+-    fixture.addEvent(event, nameBuilder, "bar_type", 10);
++    fixture.addEvent(event, nameBuilder, "bar_type");
+     fixture.execute();
+   }
+ }
+diff --git a/pom.xml b/pom.xml
+index 0cd174c9d..225ccf49f 100644
+--- a/pom.xml
++++ b/pom.xml
+@@ -62,7 +62,7 @@ limitations under the License.
+     <commons-lang.version>2.5</commons-lang.version>
+     <curator.version>2.6.0</curator.version>
+     <derby.version>10.14.1.0</derby.version>
+-    <elasticsearch.version>0.90.1</elasticsearch.version>
++    <elasticsearch.version>6.1.0</elasticsearch.version>
+     <fasterxml.jackson.version>2.8.9</fasterxml.jackson.version>
+     <fest-reflect.version>1.4</fest-reflect.version>
+     <geronimo-jms.version>1.1.1</geronimo-jms.version>
+@@ -1359,7 +1359,18 @@ limitations under the License.
+         <groupId>org.elasticsearch</groupId>
+         <artifactId>elasticsearch</artifactId>
+         <version>${elasticsearch.version}</version>
+-        <optional>true</optional>
++      </dependency>
++
++      <dependency>
++        <groupId>org.elasticsearch.client</groupId>
++        <artifactId>rest</artifactId>
++        <version>${elasticsearch.version}</version>
++      </dependency>
++
++      <dependency>
++        <groupId>org.elasticsearch.client</groupId>
++        <artifactId>transport</artifactId>
++        <version>${elasticsearch.version}</version>
+       </dependency>
+ 
+       <dependency>
